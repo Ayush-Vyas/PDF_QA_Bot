@@ -1,4 +1,5 @@
-import React, { useState } from "react";
+
+import React, { useState, useEffect } from "react";
 import axios from "axios";
 import ReactMarkdown from "react-markdown";
 import { Document, Page, pdfjs } from "react-pdf";
@@ -166,6 +167,10 @@ function App() {
   );
 
   const themeClass = darkMode ? "bg-dark text-light" : "bg-light text-dark";
+
+  const toggleTheme = () => {
+    setDarkMode(!darkMode);
+  };
 
   return (
     <div className={themeClass} style={{ minHeight: "100vh" }}>
