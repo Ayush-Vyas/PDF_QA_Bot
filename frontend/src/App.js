@@ -1,10 +1,13 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import axios from "axios";
-import ReactMarkdown from "react-markdown";
-import { Document, Page, pdfjs } from "react-pdf";
+import { saveAs } from "file-saver";
+import Papa from "papaparse";
+import jsPDF from "jspdf";
 import "bootstrap/dist/css/bootstrap.min.css";
 import {
   Container,
+  Row,
+  Col,
   Button,
   Form,
   Card,
@@ -12,68 +15,35 @@ import {
   Navbar,
 } from "react-bootstrap";
 
-pdfjs.GlobalWorkerOptions.workerSrc = new URL(
-  "pdfjs-dist/build/pdf.worker.min.mjs",
-  import.meta.url
-).toString();
-
 const API_BASE = process.env.REACT_APP_API_URL || "";
-const THEME_STORAGE_KEY = "pdf-qa-bot-theme";
 
 function App() {
-  // -------------------------------
   // Core state
-  // -------------------------------
   const [file, setFile] = useState(null);
-  const [pdfs, setPdfs] = useState([]); // { name, doc_id, url }
+  const [pdfs, setPdfs] = useState([]);
   const [selectedDocs, setSelectedDocs] = useState([]);
   const [question, setQuestion] = useState("");
   const [chatHistory, setChatHistory] = useState([]);
-  const [comparisonResult, setComparisonResult] = useState(null);
 
-  // -------------------------------
-  // UI / status state
-  // -------------------------------
+  // UI state
   const [uploading, setUploading] = useState(false);
   const [asking, setAsking] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
   const [comparing, setComparing] = useState(false);
+  const [darkMode, setDarkMode] = useState(false);
 
-  const [numPages, setNumPages] = useState(null);
-  const [pageNumber, setPageNumber] = useState(1);
+  const chatEndRef = useRef(null);
 
-  // -------------------------------
-  // Theme persistence
-  // -------------------------------
-  const [darkMode, setDarkMode] = useState(() => {
-    const saved = localStorage.getItem(THEME_STORAGE_KEY);
-    return saved ? JSON.parse(saved) : false;
-  });
-
-  // -------------------------------
-  // Session isolation (security fix)
-  // -------------------------------
-  const [sessionId, setSessionId] = useState("");
+  // simple session id
+  const sessionId = "default-session";
 
   useEffect(() => {
-    setSessionId(
-      crypto.randomUUID
-        ? crypto.randomUUID()
-        : Math.random().toString(36).substring(2, 15)
-    );
-  }, []);
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatHistory]);
 
-  useEffect(() => {
-    localStorage.setItem(THEME_STORAGE_KEY, JSON.stringify(darkMode));
-    document.body.classList.toggle("dark-mode", darkMode);
-  }, [darkMode]);
-
-  // -------------------------------
-  // Upload PDF
-  // -------------------------------
+  // Upload
   const uploadPDF = async () => {
     if (!file) return;
-
     setUploading(true);
 
     const formData = new FormData();
@@ -82,13 +52,10 @@ function App() {
 
     try {
       const res = await axios.post(`${API_BASE}/upload`, formData);
-      const url = URL.createObjectURL(file);
-
       setPdfs((prev) => [
         ...prev,
-        { name: file.name, doc_id: res.data?.doc_id, url },
+        { name: file.name, doc_id: res.data?.doc_id },
       ]);
-
       setFile(null);
       alert("PDF uploaded!");
     } catch {
@@ -98,11 +65,7 @@ function App() {
     setUploading(false);
   };
 
-  // -------------------------------
-  // Toggle document selection
-  // -------------------------------
   const toggleDocSelection = (docId) => {
-    setComparisonResult(null);
     setSelectedDocs((prev) =>
       prev.includes(docId)
         ? prev.filter((id) => id !== docId)
@@ -110,9 +73,6 @@ function App() {
     );
   };
 
-  // -------------------------------
-  // Ask question
-  // -------------------------------
   const askQuestion = async () => {
     if (!question.trim() || selectedDocs.length === 0) return;
 
@@ -141,9 +101,6 @@ function App() {
     setAsking(false);
   };
 
-  // -------------------------------
-  // Summarize PDFs
-  // -------------------------------
   const summarizePDF = async () => {
     if (selectedDocs.length === 0) return;
 
@@ -166,12 +123,8 @@ function App() {
     setSummarizing(false);
   };
 
-  // -------------------------------
-  // Compare PDFs
-  // -------------------------------
   const compareDocuments = async () => {
     if (selectedDocs.length < 2) return;
-
     setComparing(true);
 
     try {
@@ -180,31 +133,22 @@ function App() {
         sessionId,
       });
 
-      setComparisonResult(res.data.comparison);
       setChatHistory((prev) => [
         ...prev,
         { role: "bot", text: res.data.comparison },
       ]);
     } catch {
-      alert("Error comparing documents.");
+      alert("Error comparing.");
     }
 
     setComparing(false);
   };
 
-  // -------------------------------
-  // UI helpers
-  // -------------------------------
   const pageBg = darkMode ? "bg-dark text-light" : "bg-light text-dark";
   const cardClass = darkMode
-    ? "text-white border-secondary shadow"
-    : "bg-white text-dark border-0 shadow-sm";
+    ? "bg-secondary text-light shadow"
+    : "bg-white text-dark shadow-sm";
 
-  const inputClass = darkMode ? "text-white border-secondary" : "";
-
-  // -------------------------------
-  // Render
-  // -------------------------------
   return (
     <div className={pageBg} style={{ minHeight: "100vh" }}>
       <Navbar bg={darkMode ? "dark" : "primary"} variant="dark">
@@ -220,13 +164,11 @@ function App() {
       </Navbar>
 
       <Container className="mt-4">
-        {/* Upload */}
         <Card className={`mb-4 ${cardClass}`}>
           <Card.Body>
             <Form>
               <Form.Control
                 type="file"
-                className={inputClass}
                 onChange={(e) => setFile(e.target.files[0])}
               />
               <Button
@@ -240,7 +182,6 @@ function App() {
           </Card.Body>
         </Card>
 
-        {/* Document selection */}
         {pdfs.length > 0 && (
           <Card className={`mb-4 ${cardClass}`}>
             <Card.Body>
@@ -258,58 +199,62 @@ function App() {
           </Card>
         )}
 
-        {/* Chat */}
-        <Card className={cardClass}>
-          <Card.Body>
-            <div style={{ maxHeight: 300, overflowY: "auto", marginBottom: 16 }}>
-              {chatHistory.map((msg, i) => (
-                <div key={i} className="mb-2">
-                  <strong>{msg.role === "user" ? "You" : "Bot"}:</strong>
-                  <ReactMarkdown>{msg.text}</ReactMarkdown>
+        <Row className="justify-content-center">
+          <Col md={8}>
+            <Card className={cardClass}>
+              <Card.Body style={{ minHeight: 300 }}>
+                <h5>Chat</h5>
+                <div style={{ maxHeight: 250, overflowY: "auto" }}>
+                  {chatHistory.map((msg, i) => (
+                    <div key={i} className="mb-2">
+                      <strong>{msg.role === "user" ? "You" : "Bot"}:</strong>{" "}
+                      {msg.text}
+                    </div>
+                  ))}
+                  <div ref={chatEndRef} />
                 </div>
-              ))}
-            </div>
 
-            <Form
-              className="d-flex gap-2"
-              onSubmit={(e) => {
-                e.preventDefault();
-                askQuestion();
-              }}
-            >
-              <Form.Control
-                type="text"
-                placeholder="Ask a question..."
-                value={question}
-                className={inputClass}
-                onChange={(e) => setQuestion(e.target.value)}
-                disabled={asking}
-              />
-              <Button disabled={asking || !question.trim()}>
-                {asking ? <Spinner size="sm" /> : "Ask"}
-              </Button>
-            </Form>
+                <Form
+                  className="d-flex gap-2 mt-3"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    askQuestion();
+                  }}
+                >
+                  <Form.Control
+                    type="text"
+                    placeholder="Ask a question..."
+                    value={question}
+                    onChange={(e) => setQuestion(e.target.value)}
+                    disabled={asking}
+                  />
+                  <Button disabled={asking || !question.trim()}>
+                    {asking ? <Spinner size="sm" /> : "Ask"}
+                  </Button>
+                </Form>
 
-            <div className="mt-3">
-              <Button
-                variant="warning"
-                className="me-2"
-                onClick={summarizePDF}
-                disabled={summarizing}
-              >
-                {summarizing ? <Spinner size="sm" /> : "Summarize"}
-              </Button>
+                <div className="mt-3">
+                  <Button
+                    variant="warning"
+                    className="me-2"
+                    onClick={summarizePDF}
+                    disabled={summarizing}
+                  >
+                    {summarizing ? <Spinner size="sm" /> : "Summarize"}
+                  </Button>
 
-              <Button
-                variant="info"
-                onClick={compareDocuments}
-                disabled={selectedDocs.length < 2 || comparing}
-              >
-                {comparing ? <Spinner size="sm" /> : "Compare"}
-              </Button>
-            </div>
-          </Card.Body>
-        </Card>
+                  <Button
+                    variant="info"
+                    onClick={compareDocuments}
+                    disabled={selectedDocs.length < 2 || comparing}
+                  >
+                    {comparing ? <Spinner size="sm" /> : "Compare"}
+                  </Button>
+                </div>
+              </Card.Body>
+            </Card>
+          </Col>
+        </Row>
       </Container>
     </div>
   );

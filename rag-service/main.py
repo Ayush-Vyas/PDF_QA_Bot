@@ -1,92 +1,56 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel, Field, validator
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_core.documents import Document
 from dotenv import load_dotenv
-import os
-import re
-import uvicorn
-import torch
-import time
-import threading
-import logging
 from transformers import (
-    AutoConfig,
     AutoTokenizer,
     AutoModelForSeq2SeqLM,
     AutoModelForCausalLM,
+    AutoConfig,
 )
-from slowapi import Limiter
-from slowapi.util import get_remote_address
+import torch
+import os
+import re
+import uvicorn
 
-# -------------------------------------------------------------------
-# APP SETUP
-# -------------------------------------------------------------------
 load_dotenv()
+
 app = FastAPI()
 
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
+# ==============================
+# GLOBAL STATE
+# ==============================
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# -------------------------------------------------------------------
-# CONFIG
-# -------------------------------------------------------------------
+vectorstore = None
 HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-base")
-LLM_GENERATION_TIMEOUT = int(os.getenv("LLM_GENERATION_TIMEOUT", "30"))
 
-SESSION_TIMEOUT = 3600  # 1 hour
-sessions = {}  # { session_id: { vectorstore, last_accessed } }
-
-# -------------------------------------------------------------------
-# MODELS
-# -------------------------------------------------------------------
 generation_tokenizer = None
 generation_model = None
 generation_is_encoder_decoder = False
+
+# ==============================
+# EMBEDDINGS MODEL
+# ==============================
 
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-# -------------------------------------------------------------------
-# TEXT NORMALIZATION
-# -------------------------------------------------------------------
-def normalize_spaced_text(text: str) -> str:
-    def fix(match):
-        return match.group(0).replace(" ", "")
-    pattern = r"\b(?:[A-Za-z] ){2,}[A-Za-z]\b"
-    return re.sub(pattern, fix, text)
+# ==============================
+# LOAD GENERATION MODEL
+# ==============================
 
-
-def normalize_answer(text: str) -> str:
-    text = normalize_spaced_text(text)
-    text = re.sub(
-        r"^(Answer[^:]*:|Context:|Question:)\s*",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-# -------------------------------------------------------------------
-# MODEL LOADING
-# -------------------------------------------------------------------
 def load_generation_model():
     global generation_tokenizer, generation_model, generation_is_encoder_decoder
 
-    if generation_model and generation_tokenizer:
+    if generation_model is not None:
         return generation_tokenizer, generation_model, generation_is_encoder_decoder
 
     config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
-    generation_is_encoder_decoder = bool(config.is_encoder_decoder)
+    generation_is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
 
     generation_tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
 
@@ -101,42 +65,8 @@ def load_generation_model():
     generation_model.eval()
     return generation_tokenizer, generation_model, generation_is_encoder_decoder
 
-# -------------------------------------------------------------------
-# SAFE GENERATION WITH TIMEOUT
-# -------------------------------------------------------------------
-class TimeoutException(Exception):
-    pass
 
-
-def generate_with_timeout(model, encoded, max_new_tokens, pad_token_id, timeout):
-    result = {"output": None, "error": None}
-
-    def run():
-        try:
-            with torch.no_grad():
-                result["output"] = model.generate(
-                    **encoded,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    pad_token_id=pad_token_id,
-                )
-        except Exception as e:
-            result["error"] = str(e)
-
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-    t.join(timeout)
-
-    if t.is_alive():
-        raise TimeoutException("LLM generation timed out")
-
-    if result["error"]:
-        raise Exception(result["error"])
-
-    return result["output"]
-
-
-def generate_response(prompt: str, max_new_tokens: int) -> str:
+def generate_response(prompt: str, max_new_tokens: int = 400) -> str:
     tokenizer, model, is_encoder_decoder = load_generation_model()
     device = next(model.parameters()).device
 
@@ -146,41 +76,36 @@ def generate_response(prompt: str, max_new_tokens: int) -> str:
         truncation=True,
         max_length=2048,
     )
+
     encoded = {k: v.to(device) for k, v in encoded.items()}
 
     pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
-    try:
-        output_ids = generate_with_timeout(
-            model,
-            encoded,
-            max_new_tokens,
-            pad_token_id,
-            LLM_GENERATION_TIMEOUT,
+    with torch.no_grad():
+        generated_ids = model.generate(
+            **encoded,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=0.0,
+            pad_token_id=pad_token_id,
         )
-    except TimeoutException:
-        raise HTTPException(status_code=504, detail="Model timed out")
 
     if is_encoder_decoder:
-        return tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+        text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    else:
+        input_len = encoded["input_ids"].shape[1]
+        new_tokens = generated_ids[0][input_len:]
+        text = tokenizer.decode(new_tokens, skip_special_tokens=True)
 
-    input_len = encoded["input_ids"].shape[1]
-    return tokenizer.decode(
-        output_ids[0][input_len:], skip_special_tokens=True
-    ).strip()
+    return text.strip()
 
-# -------------------------------------------------------------------
+
+# ==============================
 # REQUEST MODELS
-# -------------------------------------------------------------------
-class PDFPath(BaseModel):
-    filePath: str
-    session_id: str
-
+# ==============================
 
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
-    session_id: str
-    history: list = []
 
     @validator("question")
     def validate_question(cls, v):
@@ -189,113 +114,105 @@ class AskRequest(BaseModel):
         return v.strip()
 
 
-class SummarizeRequest(BaseModel):
-    session_id: str
+class SummaryRequest(BaseModel):
+    pass
 
-# -------------------------------------------------------------------
-# SESSION CLEANUP
-# -------------------------------------------------------------------
-def cleanup_expired_sessions():
-    now = time.time()
-    expired = [
-        sid for sid, s in sessions.items()
-        if now - s["last_accessed"] > SESSION_TIMEOUT
-    ]
-    for sid in expired:
-        del sessions[sid]
 
-# -------------------------------------------------------------------
-# ENDPOINTS
-# -------------------------------------------------------------------
-@app.post("/process-pdf")
-@limiter.limit("15/15 minutes")
-def process_pdf(request: Request, data: PDFPath):
-    cleanup_expired_sessions()
+# ==============================
+# UPLOAD ENDPOINT
+# ==============================
 
-    if not os.path.exists(data.filePath):
-        raise HTTPException(status_code=404, detail="PDF not found")
+@app.post("/upload")
+async def upload_pdf(file: UploadFile = File(...)):
+    global vectorstore
 
-    loader = PyPDFLoader(data.filePath)
-    raw_docs = loader.load()
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
 
-    cleaned_docs = [
-        Document(
-            page_content=normalize_spaced_text(doc.page_content),
-            metadata=doc.metadata,
-        )
-        for doc in raw_docs
-    ]
+    file_location = f"temp_{file.filename}"
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-    chunks = splitter.split_documents(cleaned_docs)
+    with open(file_location, "wb") as f:
+        f.write(await file.read())
+
+    loader = PyPDFLoader(file_location)
+    docs = loader.load()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=150
+    )
+
+    chunks = splitter.split_documents(docs)
 
     if not chunks:
-        raise HTTPException(status_code=400, detail="No text extracted from PDF")
+        raise HTTPException(status_code=400, detail="No text found in PDF.")
 
-    sessions[data.session_id] = {
-        "vectorstore": FAISS.from_documents(chunks, embedding_model),
-        "last_accessed": time.time(),
-    }
+    vectorstore = FAISS.from_documents(chunks, embedding_model)
 
-    return {"message": "PDF processed successfully"}
+    return {"doc_id": file.filename}
 
+
+# ==============================
+# ASK ENDPOINT
+# ==============================
 
 @app.post("/ask")
-@limiter.limit("60/15 minutes")
-def ask_question(request: Request, data: AskRequest):
-    cleanup_expired_sessions()
+def ask_question(data: AskRequest):
+    global vectorstore
 
-    session = sessions.get(data.session_id)
-    if not session:
-        return {"answer": "Session expired or PDF not uploaded"}
+    if vectorstore is None:
+        return {"answer": "Please upload a PDF first."}
 
-    session["last_accessed"] = time.time()
-    vectorstore = session["vectorstore"]
+    query = data.question.strip()
 
-    docs = vectorstore.similarity_search(data.question, k=4)
+    docs = vectorstore.similarity_search(query, k=6)
+
     if not docs:
-        return {"answer": "No relevant context found."}
+        return {"answer": "Not found in document."}
 
-    context = "\n\n".join(doc.page_content for doc in docs)
+    context = "\n\n".join([doc.page_content for doc in docs])
 
     prompt = (
         "You are a helpful assistant answering ONLY from the context below.\n\n"
         f"Context:\n{context}\n\n"
-        f"Question: {data.question}\nAnswer:"
+        f"Question: {query}\nAnswer:"
     )
 
-    answer = generate_response(prompt, max_new_tokens=256)
-    return {"answer": normalize_answer(answer)}
+    answer = generate_response(prompt, max_new_tokens=300)
 
+    answer = re.sub(r"\s{2,}", " ", answer).strip()
+
+    return {"answer": answer}
+
+
+# ==============================
+# SUMMARIZE ENDPOINT
+# ==============================
 
 @app.post("/summarize")
-@limiter.limit("15/15 minutes")
-def summarize_pdf(request: Request, data: SummarizeRequest):
-    cleanup_expired_sessions()
+def summarize_pdf(data: SummaryRequest):
+    global vectorstore
 
-    session = sessions.get(data.session_id)
-    if not session:
-        return {"summary": "Session expired or PDF not uploaded"}
+    if vectorstore is None:
+        return {"summary": "Please upload a PDF first."}
 
-    session["last_accessed"] = time.time()
-    vectorstore = session["vectorstore"]
+    docs = vectorstore.similarity_search("Summarize the document", k=8)
 
-    docs = vectorstore.similarity_search("Summarize the document.", k=6)
-    if not docs:
-        return {"summary": "No content available"}
-
-    context = "\n\n".join(doc.page_content for doc in docs)
+    context = "\n\n".join([doc.page_content for doc in docs])
 
     prompt = (
-        "Summarize the document in 6-8 concise bullet points.\n"
-        f"Context:\n{context}\nSummary:"
+        "Summarize the document in 6-8 concise bullet points.\n\n"
+        f"Context:\n{context}\n\nSummary:"
     )
 
-    summary = generate_response(prompt, max_new_tokens=220)
-    return {"summary": normalize_answer(summary)}
+    summary = generate_response(prompt, max_new_tokens=350)
 
-# -------------------------------------------------------------------
-# START SERVER
-# -------------------------------------------------------------------
+    return {"summary": summary}
+
+
+# ==============================
+# RUN SERVER
+# ==============================
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
