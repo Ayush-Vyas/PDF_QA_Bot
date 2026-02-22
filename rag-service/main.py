@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -16,7 +16,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 load_dotenv()
 
 app = FastAPI()
-
+UPLOAD_DIR = os.path.realpath("./uploads")
 # ===============================
 # GLOBAL STATE
 # ===============================
@@ -113,10 +113,23 @@ class CompareRequest(BaseModel):
 def process_pdf(data: PDFPath):
     global VECTOR_STORE, DOCUMENT_REGISTRY, DOCUMENT_EMBEDDINGS
 
-    if not os.path.exists(data.filePath):
-        return {"error": "File not found."}
+    real_path = os.path.realpath(data.filePath)
 
-    loader = PyPDFLoader(data.filePath)
+    # Allow only uploads folder files
+    if not real_path.startswith(UPLOAD_DIR):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file path. Only uploaded files are allowed."
+        )
+
+    # Check file exists
+    if not os.path.exists(real_path):
+        raise HTTPException(
+            status_code=404,
+            detail="File not found."
+        )
+
+    loader = PyPDFLoader(real_path)
     docs = loader.load()
 
     splitter = RecursiveCharacterTextSplitter(
