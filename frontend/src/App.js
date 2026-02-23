@@ -89,7 +89,7 @@ function App() {
       const url = URL.createObjectURL(file);
       setPdfs((prev) => [
         ...prev,
-        { name: file.name, doc_id: res.data?.doc_id, url },
+        { name: file.name, doc_id: res.data?.doc_id, url, ext },
       ]);
 
       setFile(null);
@@ -241,14 +241,19 @@ function App() {
               <Form.Control
                 type="file"
                 className={inputClass}
+                accept=".pdf,.docx,.txt,.md"
                 onChange={(e) => setFile(e.target.files[0])}
               />
               <Button
                 className="mt-2"
-                onClick={uploadPDF}
+                onClick={uploadDocument}
                 disabled={!file || uploading}
               >
-                {uploading ? <Spinner size="sm" /> : "Upload"}
+                {uploading ? (
+                  <Spinner size="sm" animation="border" />
+                ) : (
+                  "Upload Document"
+                )}
               </Button>
             </Form>
           </Card.Body>
