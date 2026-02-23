@@ -17,7 +17,18 @@ app.use(globalLimiter);
 app.use(cors());
 app.use(express.json());
 
-const upload = multer({ dest: "uploads/" });
+const upload = multer({
+  dest: "uploads/",
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB cap
+  fileFilter: (req, file, cb) => {
+    const fileExt = path.extname(file.originalname).toLowerCase();
+    if (file.mimetype === "application/pdf" && fileExt === ".pdf") {
+      cb(null, true);
+    } else {
+      cb(new Error("INVALID_TYPE"), false);
+    }
+  },
+});
 
 app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
   try {
@@ -50,6 +61,21 @@ app.post("/compare", compareLimiter, async (req, res) => {
     console.error(err.response?.data || err.message);
     res.status(500).json({ error: "Error comparing documents" });
   }
+});
+
+// Error handling middleware for multer and validation errors
+app.use((err, req, res, next) => {
+  if (err.code === "LIMIT_FILE_SIZE") {
+    return res.status(400).json({
+      error: "File too large. Maximum allowed size is 20MB.",
+    });
+  }
+  if (err.message === "INVALID_TYPE") {
+    return res.status(400).json({
+      error: "Invalid file type. Only PDF files are accepted.",
+    });
+  }
+  next(err);
 });
 
 app.listen(4000, () => console.log("Backend running on http://localhost:4000"));
