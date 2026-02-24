@@ -35,3 +35,6 @@ venv/
 # Uploaded PDFs
 uploads/*
 !uploads/.gitkeep
+
+rag-service/temp_*
+rag-service/faiss_index/
