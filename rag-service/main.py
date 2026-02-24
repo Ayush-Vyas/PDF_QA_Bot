@@ -70,11 +70,22 @@ def generate_response(prompt: str, max_new_tokens: int = 400) -> str:
     tokenizer, model, is_encoder_decoder = load_generation_model()
     device = next(model.parameters()).device
 
-    encoded = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=2048,
+# ---------------------------------------------------------------------------
+# GROQ GENERATION
+# ---------------------------------------------------------------------------
+
+def generate_response(system_prompt: str, user_prompt: str, max_tokens: int = 600) -> str:
+    """
+    Calls the Groq chat-completions API with a system + user message pair.
+    """
+    completion = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+        max_tokens=max_tokens,
+        temperature=0.3,
     )
 
     encoded = {k: v.to(device) for k, v in encoded.items()}
@@ -204,6 +215,8 @@ def summarize_pdf(data: SummaryRequest):
         "Summarize the document in 6-8 concise bullet points.\n\n"
         f"Context:\n{context}\n\nSummary:"
     )
+    summary = normalize_answer(raw_summary)
+    return {"summary": summary}
 
     summary = generate_response(prompt, max_new_tokens=350)
 

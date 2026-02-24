@@ -13,6 +13,8 @@ import {
   Card,
   Spinner,
   Navbar,
+  Row,
+  Col,
 } from "react-bootstrap";
 
 const API_BASE = process.env.REACT_APP_API_URL || "";
@@ -45,10 +47,8 @@ function App() {
   const uploadPDF = async () => {
     if (!file) return;
     setUploading(true);
-
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("sessionId", sessionId);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 90_000);
 
     try {
       const res = await axios.post(`${API_BASE}/upload`, formData);
@@ -57,12 +57,17 @@ function App() {
         { name: file.name, doc_id: res.data?.doc_id },
       ]);
       setFile(null);
-      alert("PDF uploaded!");
-    } catch {
-      alert("Upload failed.");
+      alert("Document uploaded!");
+    } catch (e) {
+      if (e.name === "AbortError" || e.code === "ECONNABORTED") {
+        alert("Upload timed out. Try a smaller document.");
+      } else {
+        alert("Upload failed.");
+      }
+    } finally {
+      clearTimeout(timeoutId);
+      setUploading(false);
     }
-
-    setUploading(false);
   };
 
   const toggleDocSelection = (docId) => {
@@ -75,52 +80,63 @@ function App() {
 
   const askQuestion = async () => {
     if (!question.trim() || selectedDocs.length === 0) return;
-
-    setChatHistory((prev) => [...prev, { role: "user", text: question }]);
-    setQuestion("");
-    setAsking(true);
-
-    try {
-      const res = await axios.post(`${API_BASE}/ask`, {
-        question,
-        doc_ids: selectedDocs,
-        sessionId,
-      });
-
-      setChatHistory((prev) => [
-        ...prev,
-        { role: "bot", text: res.data.answer },
-      ]);
-    } catch {
-      setChatHistory((prev) => [
-        ...prev,
-        { role: "bot", text: "Error getting answer." },
-      ]);
+    if (question.length > 2000) {
+      alert("Question too long (max 2000 characters)");
+      return;
     }
 
-    setAsking(false);
+    setAsking(true);
+    setChatHistory((prev) => [...prev, { role: "user", text: question }]);
+    setQuestion("");
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 60_000);
+
+    try {
+      const res = await axios.post(
+        `${API_BASE}/ask`,
+        {
+          question,
+          sessionId,
+          doc_ids: selectedDocs,
+        },
+        { signal: controller.signal }
+      );
+
+      setChatHistory((prev) => [
+        ...prev,
+        { role: "bot", text: res.data.answer, confidence: res.data.confidence_score },
+      ]);
+    } catch (e) {
+      const msg =
+        e.name === "AbortError" || e.code === "ECONNABORTED"
+          ? "Request timed out."
+          : "Error getting answer.";
+      setChatHistory((prev) => [...prev, { role: "bot", text: msg }]);
+    } finally {
+      clearTimeout(timeoutId);
+      setAsking(false);
+    }
   };
 
   const summarizePDF = async () => {
     if (selectedDocs.length === 0) return;
 
     setSummarizing(true);
-
     try {
       const res = await axios.post(`${API_BASE}/summarize`, {
-        doc_ids: selectedDocs,
         sessionId,
+        doc_ids: selectedDocs,
       });
-
       setChatHistory((prev) => [
         ...prev,
         { role: "bot", text: res.data.summary },
       ]);
     } catch {
       alert("Error summarizing.");
+    } finally {
+      setSummarizing(false);
     }
-
-    setSummarizing(false);
   };
 
   const compareDocuments = async () => {
@@ -140,8 +156,6 @@ function App() {
     } catch {
       alert("Error comparing.");
     }
-
-    setComparing(false);
   };
 
   const pageBg = darkMode ? "bg-dark text-light" : "bg-light text-dark";
@@ -154,10 +168,7 @@ function App() {
       <Navbar bg={darkMode ? "dark" : "primary"} variant="dark">
         <Container className="d-flex justify-content-between">
           <Navbar.Brand>🤖 PDF Q&A Bot</Navbar.Brand>
-          <Button
-            variant="outline-light"
-            onClick={() => setDarkMode(!darkMode)}
-          >
+          <Button variant="outline-light" onClick={() => setDarkMode(!darkMode)}>
             {darkMode ? "Light" : "Dark"}
           </Button>
         </Container>
@@ -173,10 +184,14 @@ function App() {
               />
               <Button
                 className="mt-2"
-                onClick={uploadPDF}
+                onClick={uploadDocument}
                 disabled={!file || uploading}
               >
-                {uploading ? <Spinner size="sm" /> : "Upload"}
+                {uploading ? (
+                  <Spinner size="sm" animation="border" />
+                ) : (
+                  "Upload Document"
+                )}
               </Button>
             </Form>
           </Card.Body>
@@ -197,6 +212,33 @@ function App() {
               ))}
             </Card.Body>
           </Card>
+        )}
+        {/* Side-by-side comparison when 2 docs selected */}
+        {selectedPdfs.length === 2 && (
+          <>
+            <Card className={`mb-4 ${cardClass}`}>
+              <Card.Body>
+                <Button
+                  variant="info"
+                  onClick={compareDocuments}
+                  disabled={comparing}
+                >
+                  {comparing ? (
+                    <Spinner size="sm" animation="border" />
+                  ) : (
+                    "Generate Comparison"
+                  )}
+                </Button>
+
+                {comparisonResult && (
+                  <div className="mt-4">
+                    <h5>AI Comparison</h5>
+                    <ReactMarkdown>{comparisonResult}</ReactMarkdown>
+                  </div>
+                )}
+              </Card.Body>
+            </Card>
+          </>
         )}
 
         <Row className="justify-content-center">
