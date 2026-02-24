@@ -17,7 +17,7 @@ const THEME_STORAGE_KEY = "pdf-qa-bot-theme";
 function App() {
   // Core state
   const [file, setFile] = useState(null);
-  const [pdfs, setPdfs] = useState([]);
+  const [pdfs, setPdfs] = useState([]); // {name, sessionId, url}
   const [selectedDocs, setSelectedDocs] = useState([]);
   const [question, setQuestion] = useState("");
   const [chatHistory, setChatHistory] = useState([]);
@@ -35,17 +35,6 @@ function App() {
     return saved ? JSON.parse(saved) : false;
   });
 
-  // Session
-  const [sessionId, setSessionId] = useState("");
-
-  useEffect(() => {
-    setSessionId(
-      crypto.randomUUID
-        ? crypto.randomUUID()
-        : Math.random().toString(36).substring(2, 15)
-    );
-  }, []);
-
   useEffect(() => {
     localStorage.setItem(THEME_STORAGE_KEY, JSON.stringify(darkMode));
   }, [darkMode]);
@@ -58,15 +47,19 @@ function App() {
     try {
       const formData = new FormData();
       formData.append("file", file);
-      formData.append("sessionId", sessionId);
 
       const res = await axios.post(`${API_BASE}/upload`, formData);
 
       const url = URL.createObjectURL(file);
+      const serverSessionId = res.data?.sessionId; // Get sessionId from server
 
       setPdfs((prev) => [
         ...prev,
-        { name: file.name, doc_id: res.data?.doc_id, url },
+        { 
+          name: file.name, 
+          sessionId: serverSessionId, // Store server-returned sessionId
+          url 
+        },
       ]);
 
       setFile(null);
@@ -79,12 +72,12 @@ function App() {
   };
 
   // Toggle docs
-  const toggleDocSelection = (docId) => {
+  const toggleDocSelection = (sessionId) => {
     setComparisonResult(null);
     setSelectedDocs((prev) =>
-      prev.includes(docId)
-        ? prev.filter((id) => id !== docId)
-        : [...prev, docId]
+      prev.includes(sessionId)
+        ? prev.filter((id) => id !== sessionId)
+        : [...prev, sessionId]
     );
   };
 
@@ -96,10 +89,10 @@ function App() {
     setChatHistory((prev) => [...prev, { role: "user", text: question }]);
 
     try {
+      // Use the first selected document's sessionId
       const res = await axios.post(`${API_BASE}/ask`, {
         question,
-        sessionId,
-        doc_ids: selectedDocs,
+        sessionId: selectedDocs[0], // Send the stored sessionId
       });
 
       setChatHistory((prev) => [
@@ -107,7 +100,6 @@ function App() {
         {
           role: "bot",
           text: res.data.answer,
-          confidence: res.data.confidence_score,
         },
       ]);
     } catch {
@@ -127,9 +119,9 @@ function App() {
 
     setSummarizing(true);
     try {
+      // Use the first selected document's sessionId
       const res = await axios.post(`${API_BASE}/summarize`, {
-        sessionId,
-        doc_ids: selectedDocs,
+        sessionId: selectedDocs[0], // Send the stored sessionId
       });
 
       setChatHistory((prev) => [
@@ -168,7 +160,7 @@ function App() {
   };
 
   const selectedPdfs = pdfs.filter((p) =>
-    selectedDocs.includes(p.doc_id)
+    selectedDocs.includes(p.sessionId)
   );
 
   return (
@@ -202,10 +194,10 @@ function App() {
 
         {pdfs.map((pdf) => (
           <Form.Check
-            key={pdf.doc_id}
+            key={pdf.sessionId}
             label={pdf.name}
-            checked={selectedDocs.includes(pdf.doc_id)}
-            onChange={() => toggleDocSelection(pdf.doc_id)}
+            checked={selectedDocs.includes(pdf.sessionId)}
+            onChange={() => toggleDocSelection(pdf.sessionId)}
           />
         ))}
 
