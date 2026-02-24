@@ -1,185 +1,286 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field, validator
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.documents import Document
+from langchain_core.prompts import PromptTemplate
+from groq import Groq
 from dotenv import load_dotenv
-import os
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,
+)
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from pathlib import Path
 import uvicorn
 import torch
-from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
-import asyncio
-import threading
+import os
+import re
+import time
+import docx
 
+# ===============================
+# APP SETUP
+# ===============================
 load_dotenv()
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+UPLOAD_DIR = (BASE_DIR / "uploads").resolve()
+
 app = FastAPI()
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
 
-# Session-based storage for multi-PDF support
-pdf_sessions = {}  # {session_id: {"vectorstore": FAISS, "filename": str}}
-session_lock = threading.Lock()
+# ===============================
+# CONFIG
+# ===============================
+HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-small")
+LLM_GENERATION_TIMEOUT = int(os.getenv("LLM_GENERATION_TIMEOUT", "30"))
+SESSION_TIMEOUT = 3600
 
-HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-base")
+sessions = {}
+
+embedding_model = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".txt", ".md"]
+
 generation_tokenizer = None
 generation_model = None
 generation_is_encoder_decoder = False
 
-# Thread safety and resource management
-model_lock = threading.Lock()
-inference_semaphore = asyncio.Semaphore(2)
-MAX_GPU_MEMORY_MB = int(os.getenv("MAX_GPU_MEMORY_MB", "3000"))
+# ===============================
+# TEXT CLEANING
+# ===============================
+def normalize_spaced_text(text: str) -> str:
+    pattern = r"\b(?:[A-Za-z] ){2,}[A-Za-z]\b"
+    return re.sub(pattern, lambda m: m.group(0).replace(" ", ""), text)
 
-# Load local embedding model
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+def normalize_answer(text: str) -> str:
+    """
+    Post-processes the LLM-generated answer.
+    """
+    text = normalize_spaced_text(text)
+    text = re.sub(r"^(Answer[^:]*:|Context:|Question:)\s*", "", text, flags=re.I)
+    return text.strip()
 
 
+# ===============================
+# DOCUMENT LOADERS
+# ===============================
+def load_pdf(file_path: str):
+    return PyPDFLoader(file_path).load()
+
+
+def load_txt(file_path: str):
+    with open(file_path, "r", encoding="utf-8") as f:
+        return [Document(page_content=f.read())]
+
+
+def load_docx(file_path: str):
+    doc = docx.Document(file_path)
+    text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+    return [Document(page_content=text)]
+
+
+def load_document(file_path: str):
+    ext = Path(file_path).suffix.lower()
+    if ext == ".pdf":
+        return load_pdf(file_path)
+    elif ext == ".docx":
+        return load_docx(file_path)
+    elif ext in [".txt", ".md"]:
+        return load_txt(file_path)
+    else:
+        raise ValueError("Unsupported file format")
+
+
+# ===============================
+# MODEL LOADING
+# ===============================
 def load_generation_model():
-    global generation_tokenizer, generation_model, generation_is_encoder_decoder
-    
-    with model_lock:
-        if generation_model is not None and generation_tokenizer is not None:
-            return generation_tokenizer, generation_model, generation_is_encoder_decoder
+    global generation_model, generation_tokenizer, generation_is_encoder_decoder
 
-        config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
-        generation_is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
-        generation_tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
-
-        if generation_is_encoder_decoder:
-            generation_model = AutoModelForSeq2SeqLM.from_pretrained(HF_GENERATION_MODEL)
-        else:
-            generation_model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
-
-        if torch.cuda.is_available():
-            try:
-                generation_model = generation_model.to("cuda")
-                torch.cuda.empty_cache()
-            except RuntimeError as e:
-                print(f"GPU allocation failed: {e}. Falling back to CPU.")
-                generation_model = generation_model.to("cpu")
-
-        generation_model.eval()
+    if generation_model:
         return generation_tokenizer, generation_model, generation_is_encoder_decoder
 
+    config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
+    generation_is_encoder_decoder = bool(config.is_encoder_decoder)
 
-async def generate_response(prompt: str, max_new_tokens: int) -> str:
-    async with inference_semaphore:
-        try:
-            tokenizer, model, is_encoder_decoder = load_generation_model()
-            model_device = next(model.parameters()).device
+    generation_tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
 
-            encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-            encoded = {key: value.to(model_device) for key, value in encoded.items()}
-            pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    if generation_is_encoder_decoder:
+        generation_model = AutoModelForSeq2SeqLM.from_pretrained(HF_GENERATION_MODEL)
+    else:
+        generation_model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
 
-            with torch.no_grad():
-                generated_ids = model.generate(
-                    **encoded,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    pad_token_id=pad_token_id,
-                )
+    if torch.cuda.is_available():
+        generation_model = generation_model.to("cuda")
 
-            if model_device.type == "cuda":
-                torch.cuda.empty_cache()
+    generation_model.eval()
+    return generation_tokenizer, generation_model, generation_is_encoder_decoder
 
-            if is_encoder_decoder:
-                text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-                return text.strip()
 
-            input_len = encoded["input_ids"].shape[1]
-            new_tokens = generated_ids[0][input_len:]
-            text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-            return text.strip()
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                raise HTTPException(status_code=503, detail="GPU memory exhausted. Please try again.")
-            raise
+def generate_response(prompt: str, max_new_tokens: int):
+    tokenizer, model, is_enc = load_generation_model()
+    device = next(model.parameters()).device
 
-class PDFPath(BaseModel):
+    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+    encoded = {k: v.to(device) for k, v in encoded.items()}
+
+    output = model.generate(
+        **encoded,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+    )
+
+    if is_enc:
+        return tokenizer.decode(output[0], skip_special_tokens=True)
+
+    return tokenizer.decode(
+        output[0][encoded["input_ids"].shape[1]:],
+        skip_special_tokens=True,
+    )
+
+
+# ===============================
+# REQUEST MODELS
+# ===============================
+class DocumentPath(BaseModel):
     filePath: str
-    sessionId: str
+    session_id: str
 
-class Question(BaseModel):
-    question: str
-    sessionId: str
+
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=1)
+    session_id: str
+    history: list = []
+
+    @validator("question")
+    def validate_question(cls, v):
+        if not v.strip():
+            raise ValueError("Empty question")
+        return v.strip()
+
 
 class SummarizeRequest(BaseModel):
-    sessionId: str
+    session_id: str
+    pdf: str | None = None
 
-@app.post("/process-pdf")
-def process_pdf(data: PDFPath):
-    loader = PyPDFLoader(data.filePath)
-    docs = loader.load()
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+
+# ===============================
+# SESSION CLEANUP
+# ===============================
+def cleanup_sessions():
+    now = time.time()
+    expired = [k for k, v in sessions.items()
+               if now - v["last"] > SESSION_TIMEOUT]
+    for k in expired:
+        del sessions[k]
+
+
+# ===============================
+# PROCESS DOCUMENT
+# ===============================
+@app.post("/process")
+@limiter.limit("15/15 minutes")
+def process_doc(request: Request, data: DocumentPath):
+    cleanup_sessions()
+
+    if not os.path.exists(data.filePath):
+        raise HTTPException(404, "File not found")
+
+    docs = load_document(data.filePath)
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=150,
+    )
     chunks = splitter.split_documents(docs)
-    if not chunks:
-        return {"error": "No text chunks generated from the PDF. Please check your file."}
-    
+
     vectorstore = FAISS.from_documents(chunks, embedding_model)
-    
-    with session_lock:
-        pdf_sessions[data.sessionId] = {
-            "vectorstore": vectorstore,
-            "filename": os.path.basename(data.filePath)
-        }
 
-    return {"message": "PDF processed successfully", "sessionId": data.sessionId}
+    sessions[data.session_id] = {
+        "vectorstore": vectorstore,
+        "last": time.time(),
+    }
+
+    return {"message": "Processed successfully"}
 
 
+# ===============================
+# ASK
+# ===============================
 @app.post("/ask")
-async def ask_question(data: Question):
-    with session_lock:
-        session = pdf_sessions.get(data.sessionId)
-    
+@limiter.limit("60/15 minutes")
+def ask(request: Request, data: AskRequest):
+    cleanup_sessions()
+
+    session = sessions.get(data.session_id)
     if not session:
-        raise HTTPException(status_code=404, detail="Session not found. Please upload a PDF first.")
+        return {"answer": "Session expired", "confidence_score": 0}
 
     vectorstore = session["vectorstore"]
-    docs = vectorstore.similarity_search(data.question, k=4)
+
+    docs = vectorstore.similarity_search_with_score(data.question, k=4)
+
     if not docs:
-        return {"answer": "No relevant context found."}
+        return {"answer": "No relevant info", "confidence_score": 0}
 
-    context = "\n\n".join([doc.page_content for doc in docs])
+    context = "\n\n".join(d.page_content for d, _ in docs)
 
-    prompt = (
-        "You are a helpful assistant for question answering over PDF documents. "
-        "Use only the provided context. If the context does not contain the answer, say so briefly.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {data.question}\n"
-        "Answer:"
+    prompt = f"""
+    Answer ONLY using the context.
+
+    Context:
+    {context}
+
+    Question:
+    {data.question}
+
+    user_prompt = CCC_PROMPT.format(
+        context=context,
+        question=question_with_history,
     )
 
-    answer = await generate_response(prompt, max_new_tokens=256)
-    return {"answer": answer}
+    answer = generate_response(prompt, 150)
+
+    session["last"] = time.time()
+
+    return {"answer": normalize_answer(answer), "confidence_score": 85}
 
 
+# ===============================
+# SUMMARIZE
+# ===============================
 @app.post("/summarize")
-async def summarize_pdf(data: SummarizeRequest):
-    with session_lock:
-        session = pdf_sessions.get(data.sessionId)
-    
+def summarize(data: SummarizeRequest):
+    session = sessions.get(data.session_id)
     if not session:
-        raise HTTPException(status_code=404, detail="Session not found. Please upload a PDF first.")
+        return {"summary": "Session expired"}
 
-    vectorstore = session["vectorstore"]
-    docs = vectorstore.similarity_search("Give a concise summary of the document.", k=6)
-    if not docs:
-        return {"summary": "No document context available to summarize."}
+    docs = session["vectorstore"].similarity_search("summary", k=6)
 
-    context = "\n\n".join([doc.page_content for doc in docs])
-    prompt = (
-        "Summarize the following document content in 6-8 concise bullet points.\n\n"
-        f"Context:\n{context}\n\n"
-        "Summary:"
-    )
+    context = "\n".join(d.page_content for d in docs)
 
-    summary = await generate_response(prompt, max_new_tokens=220)
-    return {"summary": summary}
+    prompt = f"Summarize in bullet points:\n{context}"
+
+    summary = generate_response(prompt, 220)
+
+    return {"summary": normalize_answer(summary)}
 
 
+# ===============================
+# START
+# ===============================
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
