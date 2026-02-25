@@ -22,7 +22,7 @@ import torch
 import os
 import re
 import time
-import docx
+from pathlib import Path
 
 # ===============================
 # APP SETUP
@@ -51,13 +51,45 @@ embedding_model = HuggingFaceEmbeddings(
 
 SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".txt", ".md"]
 
-generation_tokenizer = None
-generation_model = None
-generation_is_encoder_decoder = False
+# -------------------------------------------------------------------
+# DOCUMENT LOADERS
+# -------------------------------------------------------------------
+def load_pdf(file_path: str) -> list[Document]:
+    loader = PyPDFLoader(file_path)
+    return loader.load()
 
-# ===============================
-# TEXT CLEANING
-# ===============================
+def load_docx(file_path: str) -> list[Document]:
+    import docx
+    doc = docx.Document(file_path)
+    texts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                texts.extend([p.text.strip() for p in cell.paragraphs if p.text.strip()])
+    full_text = "\n".join(texts)
+    return [Document(page_content=full_text, metadata={"source": file_path})]
+
+def load_txt(file_path: str) -> list[Document]:
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    return [Document(page_content=content, metadata={"source": file_path})]
+
+def load_document(file_path: str) -> list[Document]:
+    ext = Path(file_path).suffix.lower()
+    if ext == ".pdf":
+        return load_pdf(file_path)
+    elif ext == ".docx":
+        return load_docx(file_path)
+    elif ext in (".txt", ".md"):
+        return load_txt(file_path)
+    else:
+        raise ValueError(f"Unsupported format: {ext}")
+
+splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+
+# -------------------------------------------------------------------
+# TEXT NORMALIZATION
+# -------------------------------------------------------------------
 def normalize_spaced_text(text: str) -> str:
     pattern = r"\b(?:[A-Za-z] ){2,}[A-Za-z]\b"
     return re.sub(pattern, lambda m: m.group(0).replace(" ", ""), text)
@@ -177,10 +209,15 @@ class SummarizeRequest(BaseModel):
 
 
 
-# ===============================
+class CompareRequest(BaseModel):
+    session_id: str
+
+# -------------------------------------------------------------------
 # SESSION CLEANUP
-# ===============================
-def cleanup_sessions():
+# -------------------------------------------------------------------
+
+
+def cleanup_expired_sessions():
     now = time.time()
     expired = [k for k, v in sessions.items()
                if now - v["last"] > SESSION_TIMEOUT]
@@ -209,10 +246,16 @@ def process_doc(request: Request, data: DocumentPath):
 
     vectorstore = FAISS.from_documents(chunks, embedding_model)
 
-    sessions[data.session_id] = {
-        "vectorstore": vectorstore,
-        "last": time.time(),
-    }
+    if data.session_id in sessions:
+        # Append to existing vectorstore
+        sessions[data.session_id]["vectorstore"].add_documents(chunks)
+        sessions[data.session_id]["last_accessed"] = time.time()
+    else:
+        # Create new vectorstore
+        sessions[data.session_id] = {
+            "vectorstore": FAISS.from_documents(chunks, embedding_model),
+            "last_accessed": time.time(),
+        }
 
     return {"message": "Processed successfully"}
 
@@ -233,16 +276,25 @@ def ask(request: Request, data: AskRequest):
 
     docs = vectorstore.similarity_search_with_score(data.question, k=4)
 
-    if not docs:
-        return {"answer": "No relevant info", "confidence_score": 0}
+    docs_with_scores = vectorstore.similarity_search_with_score(question, k=4)
+    if not docs_with_scores:
+        return {"answer": "No relevant context found in the uploaded document.", "confidence_score": 0}
 
-    context = "\n\n".join(d.page_content for d, _ in docs)
+    # Convert FAISS scores to cosine similarities
+    scored = [(doc, score, faiss_score_to_cosine_sim(score)) for doc, score in docs_with_scores]
+    similarities = [sim for _, _, sim in scored]
+    confidence = compute_confidence([score for _, score, _ in scored])
 
-    prompt = f"""
-    Answer ONLY using the context.
+    # Relevance threshold check
+    top3_avg_sim = sum(sorted(similarities, reverse=True)[:3]) / 3 if similarities else 0
+    if top3_avg_sim < RELEVANCE_THRESHOLD:
+        return {
+            "answer": "I cannot answer this question based on the uploaded document. It appears unrelated.",
+            "confidence_score": confidence
+        }
 
-    Context:
-    {context}
+    relevant_docs = [doc for doc, _, sim in scored if sim >= RELEVANCE_THRESHOLD]
+    context = "\n\n".join([d.page_content for d in relevant_docs])
 
     Question:
     {data.question}
@@ -258,29 +310,101 @@ def ask(request: Request, data: AskRequest):
 
     return {"answer": normalize_answer(answer), "confidence_score": 85}
 
-
-# ===============================
-# SUMMARIZE
-# ===============================
 @app.post("/summarize")
-def summarize(data: SummarizeRequest):
-    session = sessions.get(data.session_id)
-    if not session:
-        return {"summary": "Session expired"}
+@limiter.limit("15/15 minutes")
+async def summarize_pdf(request: Request, data: SummarizeRequest):
+    cleanup_expired_sessions()
+    session_id = data.session_id
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
 
-    docs = session["vectorstore"].similarity_search("summary", k=6)
+    sessions[session_id]["last_accessed"] = time.time()
+    vectorstore = sessions[session_id]["vectorstore"]
 
-    context = "\n".join(d.page_content for d in docs)
+    # Extract all text from the vectorstore for summarization
+    all_docs = list(vectorstore.docstore._dict.values())
+    full_text = "\n".join([doc.page_content for doc in all_docs])
 
-    prompt = f"Summarize in bullet points:\n{context}"
+    system_prompt = (
+        "You are a document summarization assistant.\n"
+        "Rules:\n"
+        "1. Summarize in 6-8 concise bullet points.\n"
+        "2. Clearly state: who received the certificate/document, what it is for, "
+        "which organization issued it, who authorized it, and the date.\n"
+        "3. Use proper Title Case for names. Return clean, readable text.\n"
+        "4. Use ONLY the information in the provided context."
+    )
 
-    summary = generate_response(prompt, 220)
+    user_prompt = f"Content:\n{full_text[:4000]}\n\nSummary (bullet points):"
 
     return {"summary": normalize_answer(summary)}
 
 
-# ===============================
-# START
-# ===============================
+@app.post("/compare")
+@limiter.limit("15/15 minutes")
+async def compare_documents(request: Request, data: CompareRequest):
+    """
+    Compare multiple documents within a session.
+    Groups chunks by their source metadata and generates a comparative summary.
+    """
+    cleanup_expired_sessions()
+    session_id = data.session_id
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+
+    sessions[session_id]["last_accessed"] = time.time()
+    vectorstore = sessions[session_id]["vectorstore"]
+
+    # Extract all documents from the FAISS internal docstore
+    try:
+        all_docs = list(vectorstore.docstore._dict.values())
+    except Exception:
+        all_docs = []
+
+    if not all_docs:
+        return {"comparison": "No documents found to compare."}
+
+    # Group chunks by their source file
+    docs_by_source = {}
+    for doc in all_docs:
+        source = doc.metadata.get("source", "Unknown")
+        if source not in docs_by_source:
+            docs_by_source[source] = []
+        docs_by_source[source].append(doc.page_content)
+
+    sources = list(docs_by_source.keys())
+    if len(sources) < 2:
+        return {"comparison": "Please upload at least two documents to generate a comparison."}
+
+    # Prepare context for comparison
+    comparison_context = ""
+    for i, source in enumerate(sources):
+        filename = Path(source).name
+        content_sample = "\n".join(docs_by_source[source])[:1500]
+        comparison_context += f"--- Document {i+1}: {filename} ---\n{content_sample}\n\n"
+
+    system_prompt = "You are a professional analyst comparing multiple documents."
+    user_prompt = f"""
+    Please compare the following documents:
+
+    {comparison_context}
+
+    Instructions:
+    - Identify key similarities and differences.
+    - Format as a structured comparison (bullet points/sections).
+    - Be objective and concise.
+    """
+
+    comparison_result = generate_response(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        max_tokens=800
+    )
+    return {"comparison": comparison_result}
+
+
+# -------------------------------------------------------------------
+# START SERVER
+# -------------------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
