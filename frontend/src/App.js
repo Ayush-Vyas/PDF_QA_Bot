@@ -13,8 +13,6 @@ import {
   Card,
   Spinner,
   Navbar,
-  Row,
-  Col,
 } from "react-bootstrap";
 
 const API_BASE = process.env.REACT_APP_API_URL || "";
@@ -47,9 +45,6 @@ function App() {
   const uploadPDF = async () => {
     if (!file) return;
     setUploading(true);
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 90_000);
-
     try {
       const res = await axios.post(`${API_BASE}/upload`, formData);
       setPdfs((prev) => [
@@ -58,63 +53,48 @@ function App() {
       ]);
       setFile(null);
       alert("Document uploaded!");
-    } catch (e) {
-      if (e.name === "AbortError" || e.code === "ECONNABORTED") {
-        alert("Upload timed out. Try a smaller document.");
-      } else {
-        alert("Upload failed.");
-      }
+    } catch {
+      alert("Upload failed.");
     } finally {
-      clearTimeout(timeoutId);
       setUploading(false);
     }
   };
 
   const toggleDocSelection = (docId) => {
     setSelectedDocs((prev) =>
-      prev.includes(docId)
-        ? prev.filter((id) => id !== docId)
-        : [...prev, docId]
+      prev.includes(sessionId)
+        ? prev.filter((id) => id !== sessionId)
+        : [...prev, sessionId]
     );
   };
 
   const askQuestion = async () => {
     if (!question.trim() || selectedDocs.length === 0) return;
-    if (question.length > 2000) {
-      alert("Question too long (max 2000 characters)");
-      return;
-    }
 
     setAsking(true);
     setChatHistory((prev) => [...prev, { role: "user", text: question }]);
-    setQuestion("");
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 60_000);
 
     try {
-      const res = await axios.post(
-        `${API_BASE}/ask`,
-        {
-          question,
-          sessionId,
-          doc_ids: selectedDocs,
-        },
-        { signal: controller.signal }
-      );
+      // Use the first selected document's sessionId
+      const res = await axios.post(`${API_BASE}/ask`, {
+        question,
+        sessionId: selectedDocs[0], // Send the stored sessionId
+      });
 
       setChatHistory((prev) => [
         ...prev,
-        { role: "bot", text: res.data.answer, confidence: res.data.confidence_score },
+        {
+          role: "bot",
+          text: res.data.answer,
+        },
       ]);
-    } catch (e) {
-      const msg =
-        e.name === "AbortError" || e.code === "ECONNABORTED"
-          ? "Request timed out."
-          : "Error getting answer.";
-      setChatHistory((prev) => [...prev, { role: "bot", text: msg }]);
+    } catch {
+      setChatHistory((prev) => [
+        ...prev,
+        { role: "bot", text: "Error getting answer." },
+      ]);
     } finally {
-      clearTimeout(timeoutId);
+      setQuestion("");
       setAsking(false);
     }
   };
@@ -124,10 +104,11 @@ function App() {
 
     setSummarizing(true);
     try {
+      // Use the first selected document's sessionId
       const res = await axios.post(`${API_BASE}/summarize`, {
-        sessionId,
-        doc_ids: selectedDocs,
+        sessionId: selectedDocs[0], // Send the stored sessionId
       });
+
       setChatHistory((prev) => [
         ...prev,
         { role: "bot", text: res.data.summary },
@@ -164,11 +145,11 @@ function App() {
     : "bg-white text-dark shadow-sm";
 
   return (
-    <div className={pageBg} style={{ minHeight: "100vh" }}>
-      <Navbar bg={darkMode ? "dark" : "primary"} variant="dark">
+    <div className={darkMode ? "bg-dark text-light" : "bg-light"}>
+      <Navbar bg="primary" variant="dark">
         <Container className="d-flex justify-content-between">
-          <Navbar.Brand>🤖 PDF Q&A Bot</Navbar.Brand>
-          <Button variant="outline-light" onClick={() => setDarkMode(!darkMode)}>
+          <Navbar.Brand>PDF Q&A Bot</Navbar.Brand>
+          <Button onClick={() => setDarkMode(!darkMode)}>
             {darkMode ? "Light" : "Dark"}
           </Button>
         </Container>
@@ -215,30 +196,9 @@ function App() {
         )}
         {/* Side-by-side comparison when 2 docs selected */}
         {selectedPdfs.length === 2 && (
-          <>
-            <Card className={`mb-4 ${cardClass}`}>
-              <Card.Body>
-                <Button
-                  variant="info"
-                  onClick={compareDocuments}
-                  disabled={comparing}
-                >
-                  {comparing ? (
-                    <Spinner size="sm" animation="border" />
-                  ) : (
-                    "Generate Comparison"
-                  )}
-                </Button>
-
-                {comparisonResult && (
-                  <div className="mt-4">
-                    <h5>AI Comparison</h5>
-                    <ReactMarkdown>{comparisonResult}</ReactMarkdown>
-                  </div>
-                )}
-              </Card.Body>
-            </Card>
-          </>
+          <Button onClick={compareDocuments} disabled={comparing}>
+            {comparing ? "Comparing..." : "Compare"}
+          </Button>
         )}
 
         <Row className="justify-content-center">

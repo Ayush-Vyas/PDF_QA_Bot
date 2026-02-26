@@ -70,22 +70,45 @@ def generate_response(prompt: str, max_new_tokens: int = 400) -> str:
     tokenizer, model, is_encoder_decoder = load_generation_model()
     device = next(model.parameters()).device
 
-# ---------------------------------------------------------------------------
-# GROQ GENERATION
-# ---------------------------------------------------------------------------
 
-def generate_response(system_prompt: str, user_prompt: str, max_tokens: int = 600) -> str:
-    """
-    Calls the Groq chat-completions API with a system + user message pair.
-    """
-    completion = groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ],
-        max_tokens=max_tokens,
-        temperature=0.3,
+# ===============================
+# MODEL LOADING
+# ===============================
+def load_generation_model():
+    global generation_model, generation_tokenizer, generation_is_encoder_decoder
+
+    if generation_model:
+        return generation_tokenizer, generation_model, generation_is_encoder_decoder
+
+    config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
+    generation_is_encoder_decoder = bool(config.is_encoder_decoder)
+
+    generation_tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
+
+    if generation_is_encoder_decoder:
+        generation_model = AutoModelForSeq2SeqLM.from_pretrained(HF_GENERATION_MODEL)
+    else:
+        generation_model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
+
+    if torch.cuda.is_available():
+        generation_model = generation_model.to("cuda")
+
+    generation_model.eval()
+    return generation_tokenizer, generation_model, generation_is_encoder_decoder
+
+
+def generate_response(prompt: str, max_new_tokens: int):
+    tokenizer, model, is_enc = load_generation_model()
+    device = next(model.parameters()).device
+
+    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+    encoded = {k: v.to(device) for k, v in encoded.items()}
+
+    output = model.generate(
+        **encoded,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
     )
 
     encoded = {k: v.to(device) for k, v in encoded.items()}
@@ -209,7 +232,6 @@ def summarize_pdf(data: SummaryRequest):
 
     docs = vectorstore.similarity_search("Summarize the document", k=8)
 
-    context = "\n\n".join([doc.page_content for doc in docs])
 
     prompt = (
         "Summarize the document in 6-8 concise bullet points.\n\n"
